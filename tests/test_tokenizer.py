@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-import resource
+
 import sys
 
 import psutil
@@ -15,10 +15,10 @@ from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
 VOCAB_PATH = FIXTURES_PATH / "gpt2_vocab.json"
 MERGES_PATH = FIXTURES_PATH / "gpt2_merges.txt"
 
-
 def memory_limit(max_mem):
     def decorator(f):
         def wrapper(*args, **kwargs):
+            import resource
             process = psutil.Process(os.getpid())
             prev_limits = resource.getrlimit(resource.RLIMIT_AS)
             resource.setrlimit(resource.RLIMIT_AS, (process.memory_info().rss + max_mem, -1))
@@ -29,6 +29,7 @@ def memory_limit(max_mem):
                 # Even if the function above fails (e.g., it exceeds the
                 # memory limit), reset the memory limit back to the
                 # previous limit so other tests aren't affected.
+                import resource
                 resource.setrlimit(resource.RLIMIT_AS, prev_limits)
 
         return wrapper

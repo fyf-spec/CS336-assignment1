@@ -89,14 +89,14 @@ class Tokenizer:
                 pair = (token_list[i], token_list[i+1])
                 rank = self.merge_rank.get(pair)
                 if rank is not None and rank < best_rank:
-                    nest_rank = rank
+                    best_rank = rank
                     best_pair = pair
 
             if best_pair == None: break
             # if find merges appliable, apply here
             i = 0
             new_token_list : list[bytes] = []
-            while i < len(token_list):
+            while i < len(token_list) - 1:
                 pair = (token_list[i], token_list[i+1])
                 if i < len(token_list) - 1 and pair == best_pair:
                     new_token_list.append(pair[0] + pair[1])
@@ -165,7 +165,30 @@ class Tokenizer:
         return ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        raise NotImplementedError
+        """Given an iterable of strings, lazily yield token IDs.
+
+        This is memory-efficient: instead of loading an entire file into
+        a single string and encoding it all at once, we process one chunk
+        (e.g., one line) at a time and yield its token IDs before moving
+        to the next chunk.
+        """
+        for text in iterable:
+            yield from self.encode(text)
 
     def decode(self, ids: list[int]) -> str:
-        raise NotImplementedError
+        """
+        Decode a list of token IDs back into a string.
+
+        Steps:
+          1. Look up each ID in vocab to get its byte sequence.
+          2. Concatenate all byte sequences.
+          3. Decode the resulting bytes using UTF-8.
+        """
+        # Step 1: Look up each ID in vocab to get its byte sequence
+        byte_sequences = [self.vocab[id] for id in ids]
+
+        # Step 2: Concatenate all byte sequences
+        concatenated_bytes = b"".join(byte_sequences)
+
+        # Step 3: Decode the resulting bytes using UTF-8
+        return concatenated_bytes.decode("utf-8", errors="replace")

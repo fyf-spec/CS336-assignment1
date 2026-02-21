@@ -143,6 +143,8 @@ def train_bpe(
     vocab_size: int,
     special_tokens: list[str],
     num_processes: int | None = None,
+    vocab_path : str = 'vocab.json',
+    merges_path : str = 'merges.txt'
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """Train a byte-level BPE tokenizer.
 
@@ -249,5 +251,5 @@ def train_bpe(
         vocab[len(special_tokens) + 256 + i] = t1 + t2
 
     # ── Step 4: Save vocabulary ───────────────────────────────────────
-    save_vocab_and_merges(vocab, merges, "vocab.json", "merges.txt")
+    save_vocab_and_merges(vocab, merges, vocab_path, merges_path)
     return vocab, merges
