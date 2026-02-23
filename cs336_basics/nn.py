@@ -507,3 +507,99 @@ class TransformerLM(nn.Module):
             x = layer(x, token_positions)
         x = self.ln_final(x)
         return self.lm_head(x)
+
+
+def cross_entropy_loss(
+    logits: torch.Tensor, # (..., vocab_size)
+    targets: torch.Tensor, # (..., )
+) -> torch.Tensor:
+    max_logit = torch.max(logits, dim=-1, keepdim=True).values
+    shifted = logits - max_logit
+    log_sum_exp = torch.log(torch.sum(torch.exp(shifted), dim=-1))
+    target_logits = torch.gather(shifted, dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    loss = log_sum_exp - target_logits
+    return loss.mean()
+
+
+@torch.no_grad()
+def decode(
+    model: TransformerLM,
+    prompt: torch.Tensor,
+    max_new_tokens: int,
+    temperature: float = 1.0,
+    top_p: float = 0.0,
+    eos_token_id: int | None = None,
+) -> torch.Tensor:
+    """
+    Autoregressively generate tokens from the language model.
+
+    Args:
+        model: A TransformerLM instance.
+        prompt: Integer tensor of shape (seq_len,) with the prompt token IDs.
+        max_new_tokens: Maximum number of new tokens to generate.
+        temperature: Temperature for softmax scaling. Lower values make the
+            distribution sharper (more greedy); higher values make it flatter.
+        top_p: If > 0, use nucleus (top-p) sampling. Only the smallest set of
+            tokens whose cumulative probability >= top_p are kept. Set to 0.0
+            to disable.
+        eos_token_id: If provided, stop generation when this token is produced.
+
+    Returns:
+        Integer tensor of shape (prompt_len + generated_len,) with the full
+        sequence (prompt + generated tokens).
+    """
+    model.eval()
+    # Work with a single sequence (no batch dim during generation for simplicity).
+    # prompt shape: (seq_len,)
+    generated = prompt.clone()  # (current_len,)
+
+    for _ in range(max_new_tokens):
+        # Truncate from the left if the sequence exceeds the model's context window.
+        # Infer context_length from the RoPE cache size of the first layer.
+        context_length = model.layers[0].attn.rope.cos_cached.shape[0]
+        context = generated[-context_length:]
+        input_ids = context.unsqueeze(0)  # (1, current_len)
+
+        # Forward pass
+        logits = model(input_ids)  # (1, current_len, vocab_size)
+
+        # Take logits at the last position
+        next_logits = logits[0, -1, :]  # (vocab_size,)
+
+        # Apply temperature scaling
+        if temperature != 1.0 and temperature > 0:
+            next_logits = next_logits / temperature
+
+        # Convert to probabilities
+        probs = softmax(next_logits, dim=-1)  # (vocab_size,)
+
+        # Apply top-p (nucleus) sampling
+        if top_p > 0.0 and top_p < 1.0:
+            # Sort probabilities in descending order
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            # Find the cutoff: smallest set of tokens with cumsum >= top_p
+            # We want to zero out everything AFTER the cumsum first exceeds top_p.
+            # Shift right so that the token that pushes cumsum over top_p is still included.
+            sorted_mask = cumulative_probs - sorted_probs >= top_p
+            sorted_probs[sorted_mask] = 0.0
+
+            # Re-normalize
+            sorted_probs = sorted_probs / sorted_probs.sum()
+
+            # Sample from the filtered distribution
+            sampled_index = torch.multinomial(sorted_probs, num_samples=1)
+            next_token = sorted_indices[sampled_index]
+        else:
+            # Standard sampling (no top-p filtering)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+        # Append the new token
+        generated = torch.cat([generated, next_token.squeeze(-1)], dim=0)
+
+        # Check for EOS
+        if eos_token_id is not None and next_token.item() == eos_token_id:
+            break
+
+    return generated
