@@ -32,8 +32,8 @@ def get_batch(
     x_list = [dataset[i : i + context_length] for i in ix]
     y_list = [dataset[i + 1 : i + context_length + 1] for i in ix]
     
-    x = torch.from_numpy(np.stack(x_list)).to(device)
-    y = torch.from_numpy(np.stack(y_list)).to(device)
+    x = torch.from_numpy(np.stack(x_list)).to(device).to(torch.long)
+    y = torch.from_numpy(np.stack(y_list)).to(device).to(torch.long)
     
     return x, y
 
@@ -57,7 +57,7 @@ def save_checkpoint(
         "optimizer": optimizer.state_dict(),
         "it": it,
     }
-    torch.save(checkpoint, out)
+    torch.save(checkpoint, out, _use_new_zipfile_serialization=False)
 
 def load_checkpoint(
     src: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],

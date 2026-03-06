@@ -129,6 +129,7 @@ class RMSNorm(nn.Module):
         Returns:
             Normalized tensor of the same shape.
         """
+        assert x.shape[-1] == self.d_model, f"RMSNorm expected last dim {self.d_model}, got {x.shape[-1]}"
         in_dtype = x.dtype
         x = x.to(torch.float32)
 
@@ -189,9 +190,12 @@ class SwiGLU(nn.Module):
         Returns:
             Output tensor of shape (..., d_model).
         """
+        assert x.shape[-1] == self.w1.in_features, f"SwiGLU input dim mismatch: expected {self.w1.in_features}, got {x.shape[-1]}"
         gate = silu(self.w1(x))   # SiLU(W₁x):  (..., d_ff)
         value = self.w3(x)        # W₃x:        (..., d_ff)
-        return self.w2(gate * value)  # W₂(gate ⊙ value): (..., d_model)
+        out = self.w2(gate * value)  # W₂(gate ⊙ value): (..., d_model)
+        assert out.shape == x.shape, f"SwiGLU output shape {out.shape} != input {x.shape}"
+        return out
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -270,7 +274,26 @@ class RotaryPositionalEmbedding(nn.Module):
 def softmax(
     x: torch.Tensor,
     dim: int,
+    temperature: float = 1.0,
 ) -> torch.Tensor:
+    """Numerically-stable softmax with optional temperature scaling.
+
+    softmax(v, τ)_i = exp(v_i / τ) / Σ_j exp(v_j / τ)
+
+    When τ → 0, the output concentrates on the argmax (greedy).
+    When τ = 1, this is the standard softmax.
+    When τ > 1, the distribution becomes flatter (more uniform).
+
+    Args:
+        x: Input tensor of arbitrary shape.
+        dim: Dimension along which to apply softmax.
+        temperature: Temperature parameter τ. Must be > 0.  Default 1.0.
+
+    Returns:
+        Tensor of the same shape as x, with softmax applied along `dim`.
+    """
+    if temperature != 1.0:
+        x = x / temperature
     max_o = torch.max(x, dim=dim, keepdim=True).values
     exp_x = torch.exp(x - max_o)
     sum_exp_x = torch.sum(exp_x, dim=dim, keepdim=True)
@@ -298,12 +321,15 @@ def scaled_dot_product_attention(
         Output tensor of shape (..., n, d_v).
     """
     d_k = Q.shape[-1]
+    assert K.shape[-1] == d_k, f"Q and K must have same d_k, got {d_k} and {K.shape[-1]}"
+    assert V.shape[-2] == K.shape[-2], f"K and V must have same sequence length m"
 
     # Q K^T / sqrt(d_k)  →  (..., n, m)
     scores = einsum(Q, K, "... n d_k, ... m d_k -> ... n m") / math.sqrt(d_k)
 
     # Apply mask: set False positions to -inf so softmax gives them 0 weight
     if mask is not None:
+        assert mask.shape[-2:] == scores.shape[-2:], "Mask shape mismatch"
         scores = scores.masked_fill(~mask, float("-inf"))
 
     # Softmax over the key dimension (last dim)
@@ -508,6 +534,83 @@ class TransformerLM(nn.Module):
         x = self.ln_final(x)
         return self.lm_head(x)
 
+    @torch.no_grad()
+    def decode(
+        self,
+        prompt: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_p: float = 0.0,
+        eos_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """
+        Autoregressively generate tokens from this language model.
+
+        At each step we feed the current sequence through the model, take
+        the logits at the **last** position, apply temperature-scaled softmax
+        and (optionally) nucleus / top-p sampling, then append the sampled
+        token and repeat.
+
+        Args:
+            prompt: Integer tensor of shape (seq_len,) with the prompt token IDs.
+            max_new_tokens: Maximum number of new tokens to generate.
+            temperature: Temperature for softmax scaling (τ in Eq 24).
+                Lower → sharper / more greedy; higher → flatter / more random.
+            top_p: If > 0, use nucleus (top-p) sampling. Only the smallest
+                set of tokens whose cumulative probability ≥ top_p are kept.
+                Set to 0.0 to disable.
+            eos_token_id: If provided, stop generation when this token is
+                produced.
+
+        Returns:
+            Integer tensor of shape (prompt_len + generated_len,) with the
+            full sequence (prompt + generated tokens).
+        """
+        self.eval()
+        generated = prompt.clone()  # (current_len,)
+
+        # Infer maximum context length from RoPE cache
+        context_length = self.layers[0].attn.rope.cos_cached.shape[0]
+
+        for _ in range(max_new_tokens):
+            # Truncate from the left if the sequence exceeds the context window
+            context = generated[-context_length:]
+            input_ids = context.unsqueeze(0)  # (1, current_len)
+
+            # Forward pass → logits at the last position
+            logits = self.forward(input_ids)   # (1, current_len, vocab_size)
+            next_logits = logits[0, -1, :]     # (vocab_size,)
+
+            # Temperature-scaled softmax (τ is folded into the softmax itself)
+            probs = softmax(next_logits, dim=-1, temperature=temperature)
+
+            # Nucleus / top-p sampling
+            if top_p > 0.0 and top_p < 1.0:
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+                # Zero out everything after cumsum first exceeds top_p
+                sorted_mask = cumulative_probs - sorted_probs >= top_p
+                sorted_probs[sorted_mask] = 0.0
+
+                # Re-normalize
+                sorted_probs = sorted_probs / sorted_probs.sum()
+
+                sampled_index = torch.multinomial(sorted_probs, num_samples=1)
+                next_token = sorted_indices[sampled_index]
+            else:
+                # Standard categorical sampling
+                next_token = torch.multinomial(probs, num_samples=1)
+
+            # Append the new token
+            generated = torch.cat([generated, next_token.squeeze(-1)], dim=0)
+
+            # Early stop on EOS
+            if eos_token_id is not None and next_token.item() == eos_token_id:
+                break
+
+        return generated
+
 
 def cross_entropy_loss(
     logits: torch.Tensor, # (..., vocab_size)
@@ -530,76 +633,14 @@ def decode(
     top_p: float = 0.0,
     eos_token_id: int | None = None,
 ) -> torch.Tensor:
+    """Thin wrapper that delegates to TransformerLM.decode().
+
+    Kept for backward compatibility — prefer calling model.decode() directly.
     """
-    Autoregressively generate tokens from the language model.
-
-    Args:
-        model: A TransformerLM instance.
-        prompt: Integer tensor of shape (seq_len,) with the prompt token IDs.
-        max_new_tokens: Maximum number of new tokens to generate.
-        temperature: Temperature for softmax scaling. Lower values make the
-            distribution sharper (more greedy); higher values make it flatter.
-        top_p: If > 0, use nucleus (top-p) sampling. Only the smallest set of
-            tokens whose cumulative probability >= top_p are kept. Set to 0.0
-            to disable.
-        eos_token_id: If provided, stop generation when this token is produced.
-
-    Returns:
-        Integer tensor of shape (prompt_len + generated_len,) with the full
-        sequence (prompt + generated tokens).
-    """
-    model.eval()
-    # Work with a single sequence (no batch dim during generation for simplicity).
-    # prompt shape: (seq_len,)
-    generated = prompt.clone()  # (current_len,)
-
-    for _ in range(max_new_tokens):
-        # Truncate from the left if the sequence exceeds the model's context window.
-        # Infer context_length from the RoPE cache size of the first layer.
-        context_length = model.layers[0].attn.rope.cos_cached.shape[0]
-        context = generated[-context_length:]
-        input_ids = context.unsqueeze(0)  # (1, current_len)
-
-        # Forward pass
-        logits = model(input_ids)  # (1, current_len, vocab_size)
-
-        # Take logits at the last position
-        next_logits = logits[0, -1, :]  # (vocab_size,)
-
-        # Apply temperature scaling
-        if temperature != 1.0 and temperature > 0:
-            next_logits = next_logits / temperature
-
-        # Convert to probabilities
-        probs = softmax(next_logits, dim=-1)  # (vocab_size,)
-
-        # Apply top-p (nucleus) sampling
-        if top_p > 0.0 and top_p < 1.0:
-            # Sort probabilities in descending order
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-
-            # Find the cutoff: smallest set of tokens with cumsum >= top_p
-            # We want to zero out everything AFTER the cumsum first exceeds top_p.
-            # Shift right so that the token that pushes cumsum over top_p is still included.
-            sorted_mask = cumulative_probs - sorted_probs >= top_p
-            sorted_probs[sorted_mask] = 0.0
-
-            # Re-normalize
-            sorted_probs = sorted_probs / sorted_probs.sum()
-
-            # Sample from the filtered distribution
-            sampled_index = torch.multinomial(sorted_probs, num_samples=1)
-            next_token = sorted_indices[sampled_index]
-        else:
-            # Standard sampling (no top-p filtering)
-            next_token = torch.multinomial(probs, num_samples=1)
-
-        # Append the new token
-        generated = torch.cat([generated, next_token.squeeze(-1)], dim=0)
-
-        # Check for EOS
-        if eos_token_id is not None and next_token.item() == eos_token_id:
-            break
-
-    return generated
+    return model.decode(
+        prompt=prompt,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+    )
